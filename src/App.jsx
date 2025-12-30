@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import * as htmlToImage from 'html-to-image';
 import download from 'downloadjs';
+import { ResizableImage } from './components/ResizableImage';
 import './App.css';
 
 // Config
@@ -70,6 +71,8 @@ function App() {
     // Manual Input State
     const [manualImage, setManualImage] = useState(null);
     const [manualUrl, setManualUrl] = useState('');
+    const [aiPrompt, setAiPrompt] = useState('');
+    const [isGenerating, setIsGenerating] = useState(false);
 
     // Custom Editor State (Photoshop-like controls)
     const [canvasSize, setCanvasSize] = useState({ width: 500, height: 500 });
@@ -82,8 +85,70 @@ function App() {
 
     const [activeTool, setActiveTool] = useState('adjust'); // 'adjust', 'filters', 'transform'
 
+    // CUSTOM LAYERS (New feature: Multiple images)
+    const [customLayers, setCustomLayers] = useState([]);
+    const [selectedLayerId, setSelectedLayerId] = useState(null);
+
+    // Single Layer State (For Local/Online modes to support resizing)
+    const [singleLayerAttrs, setSingleLayerAttrs] = useState(null);
+
+    // My Saved Templates
+    const [savedTemplates, setSavedTemplates] = useState([]);
+    const [savedId, setSavedId] = useState(null);
+
     // Text State
     const [texts, setTexts] = useState(DEFAULT_TEXTS);
+    const [savedTexts, setSavedTexts] = useState({});
+    const [customId, setCustomId] = useState(Date.now());
+
+    const getContextKey = (m, l, o, c, s) => {
+        if (m === 'local') return `local-${l}`;
+        if (m === 'online') return `online-${o?.id || 'null'}`;
+        if (m === 'custom') return `custom-${c}`;
+        if (m === 'saved') return `saved-${s}`;
+        return 'unknown';
+    };
+
+    const changeContext = ({ nextMode, nextLocal, nextMeme, nextCustomId, nextSavedId }) => {
+        // Defaults
+        const nMode = nextMode !== undefined ? nextMode : mode;
+        const nLocal = nextLocal !== undefined ? nextLocal : localMood;
+        const nMeme = nextMeme !== undefined ? nextMeme : selectedMeme;
+        const nCustomId = nextCustomId !== undefined ? nextCustomId : customId;
+        const nSavedId = nextSavedId !== undefined ? nextSavedId : savedId;
+
+        // 1. Save Current
+        const currentKey = getContextKey(mode, localMood, selectedMeme, customId, savedId);
+        const updatedSaved = { ...savedTexts, [currentKey]: texts };
+        setSavedTexts(updatedSaved);
+
+        // 2. Set States
+        if (nextMode !== undefined && nextMode !== mode) setMode(nextMode);
+        if (nextLocal !== undefined && nextLocal !== localMood) setLocalMood(nextLocal);
+        if (nextMeme !== undefined && nextMeme !== selectedMeme) setSelectedMeme(nextMeme);
+        if (nextCustomId !== undefined && nextCustomId !== customId) setCustomId(nextCustomId);
+        if (nextSavedId !== undefined && nextSavedId !== savedId) setSavedId(nextSavedId);
+
+        // 3. Load New
+        const nextKey = getContextKey(nMode, nLocal, nMeme, nCustomId, nSavedId);
+        setTexts(updatedSaved[nextKey] || DEFAULT_TEXTS);
+    };
+
+    const getCurrentLikeness = () => {
+        if (mode === 'local') {
+            const reaction = LOCAL_REACTIONS.find(r => r.id === localMood) || LOCAL_REACTIONS[0];
+            return reaction.src;
+        } else if (mode === 'saved') {
+            const template = savedTemplates.find(t => t.id === savedId);
+            return template ? template.src : '/default.jpg';
+        } else if (mode === 'custom') {
+            return manualImage || '/default.jpg';
+        } else {
+            return selectedMeme ? selectedMeme.url : '/default.jpg';
+        }
+    };
+
+    const currentImageSrc = getCurrentLikeness();
 
     const memeRef = useRef(null);
     const scrollRef = useRef(null);
@@ -103,6 +168,39 @@ function App() {
             .catch(err => console.error("Failed to fetch memes", err));
     }, []);
 
+    // Effect: Handle resizing capabilities for Local/Online/Saved modes
+    useEffect(() => {
+        if (mode === 'custom') return;
+
+        const img = new Image();
+        img.onload = () => {
+            const w = img.naturalWidth;
+            const h = img.naturalHeight;
+
+            // Constrain MAX size to prevent "zooming" / overflow issues
+            const MAX_DIM = 800;
+            let finalW = w;
+            let finalH = h;
+            if (w > MAX_DIM || h > MAX_DIM) {
+                const ratio = w / h;
+                if (w > h) {
+                    finalW = MAX_DIM;
+                    finalH = MAX_DIM / ratio;
+                } else {
+                    finalH = MAX_DIM;
+                    finalW = MAX_DIM * ratio;
+                }
+            }
+
+            setCanvasSize({ width: finalW, height: finalH });
+            setSingleLayerAttrs({
+                x: 0, y: 0, width: finalW, height: finalH, rotate: 0
+            });
+            setSelectedLayerId('single-main');
+        };
+        img.src = currentImageSrc;
+    }, [currentImageSrc, mode]);
+
     useEffect(() => {
         if (searchQuery.trim() === '') {
             setFilteredMemes(allOnlineMemes);
@@ -116,9 +214,7 @@ function App() {
     }, [searchQuery, allOnlineMemes]);
 
     const handleTabChange = (newMode) => {
-        setMode(newMode);
-        // Reset texts
-        setTexts(DEFAULT_TEXTS);
+        changeContext({ nextMode: newMode });
     };
 
     const handleScroll = (e) => {
@@ -140,14 +236,85 @@ function App() {
         }
     };
 
+    const addCustomLayer = (src, dims = null) => {
+        const newLayer = {
+            id: Date.now(),
+            src: src,
+            x: dims ? 0 : 50,
+            y: dims ? 0 : 50,
+            width: dims ? dims.width : 200,
+            height: dims ? dims.height : 200,
+            rotate: 0
+        };
+        setCustomLayers(prev => [...prev, newLayer]);
+        setSelectedLayerId(newLayer.id);
+    };
+
+    const updateCustomLayer = (id, newAttrs) => {
+        setCustomLayers(prev => prev.map(l => l.id === id ? { ...l, ...newAttrs } : l));
+    };
+
+    const removeCustomLayer = (id) => {
+        setCustomLayers(prev => prev.filter(l => l.id !== id));
+        if (selectedLayerId === id) setSelectedLayerId(null);
+    };
+
+    const processNewImage = (src) => {
+        const img = new Image();
+        img.onload = () => {
+            const dims = { width: img.naturalWidth, height: img.naturalHeight };
+
+            // Constrain Size
+            const MAX_DIM = 800;
+            if (dims.width > MAX_DIM || dims.height > MAX_DIM) {
+                const ratio = dims.width / dims.height;
+                if (dims.width > dims.height) {
+                    dims.width = MAX_DIM;
+                    dims.height = MAX_DIM / ratio;
+                } else {
+                    dims.height = MAX_DIM;
+                    dims.width = MAX_DIM * ratio;
+                }
+            }
+
+            // If this is the FIRST layer (or we are starting custom mode fresh), resize canvas
+            // We check if mode is NOT custom yet, OR if customLayers is empty
+            const isFirst = mode !== 'custom' || customLayers.length === 0;
+
+            if (isFirst) {
+                // Resize Canvas
+                setCanvasSize({ width: dims.width, height: dims.height });
+                // Switch mode
+                if (mode !== 'custom') {
+                    changeContext({ nextMode: 'custom', nextCustomId: Date.now() });
+                }
+                // Add as base layer (full size at 0,0)
+                const newId = Date.now();
+                setCustomLayers([{
+                    id: newId,
+                    src: src,
+                    x: 0, y: 0,
+                    width: dims.width,
+                    height: dims.height,
+                    rotate: 0
+                }]);
+                setSelectedLayerId(newId);
+            } else {
+                // Just add as new layer (maybe scale down if huge?)
+                // For now, let's add it at original size but offset
+                addCustomLayer(src, dims);
+            }
+            resetEditor(false); // Don't reset canvas size if we just set it
+        };
+        img.src = src;
+    };
+
     const handleFileUpload = (e) => {
         const file = e.target.files[0];
         if (file) {
             const reader = new FileReader();
             reader.onloadend = () => {
-                setManualImage(reader.result);
-                handleTabChange('custom');
-                resetEditor();
+                processNewImage(reader.result);
             };
             reader.readAsDataURL(file);
         }
@@ -155,41 +322,52 @@ function App() {
 
     const handleUrlSubmit = () => {
         if (manualUrl) {
-            setManualImage(manualUrl);
-            handleTabChange('custom');
+            processNewImage(manualUrl);
             setManualUrl('');
-            resetEditor();
         }
     };
 
-    const handleAddToCustom = (meme) => {
-        setManualImage(meme.url);
-        handleTabChange('custom');
-        resetEditor();
+    const handleAddToCustom = (item) => {
+        // Handle both online memes (url) and saved templates (src)
+        const src = item.url || item.src;
+        if (src) processNewImage(src);
     };
 
-    const resetEditor = () => {
-        setCanvasSize({ width: 500, height: 500 });
+    const handleAIGenerate = () => {
+        if (!aiPrompt.trim()) return;
+        setIsGenerating(true);
+        // Use pollinations.ai for free generation
+        const prompt = encodeURIComponent(aiPrompt);
+        const url = `https://image.pollinations.ai/prompt/${prompt}?width=800&height=800&nologo=true`;
+
+        // Pre-fetch to ensure it loads
+        const img = new Image();
+        img.onload = () => {
+            setIsGenerating(false);
+            processNewImage(url);
+            setAiPrompt('');
+        };
+        img.onerror = () => {
+            setIsGenerating(false);
+            alert('Failed to generate image. Please try a different prompt.');
+        };
+        img.src = url;
+    };
+
+    const resetEditor = (resetCanvas = true) => {
+        if (resetCanvas) setCanvasSize({ width: 500, height: 500 });
         setImageTransform({ scale: 100, x: 0, y: 0, rotate: 0, flipH: false, flipV: false });
         setImageFilters({ brightness: 100, contrast: 100, saturate: 100, grayscale: 0, sepia: 0, hue: 0, blur: 0 });
     };
 
-    const getCurrentLikeness = () => {
-        if (mode === 'local') {
-            const reaction = LOCAL_REACTIONS.find(r => r.id === localMood) || LOCAL_REACTIONS[0];
-            return reaction.src;
-        } else if (mode === 'custom') {
-            return manualImage || '/default.jpg';
-        } else {
-            return selectedMeme ? selectedMeme.url : '/default.jpg';
-        }
-    };
+
 
     const handleRandomize = () => {
-        handleTabChange('online');
         if (allOnlineMemes.length > 0) {
             const randomMeme = allOnlineMemes[Math.floor(Math.random() * allOnlineMemes.length)];
-            setSelectedMeme(randomMeme);
+            changeContext({ nextMode: 'online', nextMeme: randomMeme });
+        } else {
+            changeContext({ nextMode: 'online' });
         }
     };
 
@@ -215,6 +393,38 @@ function App() {
             download(dataUrl, `meme-gen-ultimate.${ext}`);
         } catch (error) {
             console.error('Download failed', error);
+        }
+    };
+
+    const handleSaveTemplate = (src, label) => {
+        const newTemplate = {
+            id: Date.now(),
+            src: src,
+            label: label || `Template ${savedTemplates.length + 1}`
+        };
+        setSavedTemplates(prev => [newTemplate, ...prev]);
+
+        // Optionally switch to it immediately
+        // changeContext({ nextMode: 'saved', nextSavedId: newTemplate.id });
+    };
+
+    const handleSaveCanvasAsTemplate = async () => {
+        if (!memeRef.current) return;
+        try {
+            // Temporarily hide handles? Not easily possible without state, but usually handles are external to 'memeRef' content if we structure right.
+            // Currently handles are inside 'meme-boundary' if layers are selected. 
+            // We should ideally deselect everything before snapshotting so no borders appear.
+            const oldSelection = selectedLayerId;
+            setSelectedLayerId(null);
+
+            // Wait a tick for react to re-render clean state
+            setTimeout(async () => {
+                const dataUrl = await htmlToImage.toPng(memeRef.current, { backgroundColor: '#fff' });
+                handleSaveTemplate(dataUrl, `Studio Create ${new Date().toLocaleTimeString()}`);
+                setSelectedLayerId(oldSelection); // restore selection
+            }, 100);
+        } catch (err) {
+            console.error(err);
         }
     };
 
@@ -245,12 +455,17 @@ function App() {
         setTexts(texts.filter(t => t.id !== id));
     };
 
-    const currentImageSrc = getCurrentLikeness();
+
 
     const getImageStyle = () => {
         const baseStyle = { width: '100%', height: 'auto' };
 
         if (mode === 'custom') {
+            // In custom mode with layers, the "base" image is just for fallback or reference if needed, 
+            // but we primarily use layers. 
+            // However, to keep backward compat if customLayers is empty, we show manualImage.
+            if (customLayers.length > 0) return { display: 'none' }; // Hide base if layers exist
+
             baseStyle.width = '100%';
             baseStyle.height = '100%';
             baseStyle.objectFit = 'contain';
@@ -277,16 +492,15 @@ function App() {
     };
 
     const getBoundaryStyle = () => {
-        if (mode === 'custom') {
-            return {
-                width: `${canvasSize.width}px`,
-                height: `${canvasSize.height}px`,
-                minWidth: 'auto',
-                maxWidth: 'none',
-                background: '#fff' // Default canvas bg
-            };
-        }
-        return {};
+        // Apply canvas size in ALL modes now
+        return {
+            width: `${canvasSize.width}px`,
+            height: `${canvasSize.height}px`,
+            minWidth: 'auto',
+            maxWidth: 'none',
+            background: '#fff', // Default canvas bg
+            display: 'block' // Ensure it's not flex centering children weirdly if we want absolute positioning
+        };
     };
 
     return (
@@ -311,6 +525,9 @@ function App() {
                 </button>
                 <button className={`nav-item ${mode === 'online' ? 'active' : ''}`} onClick={() => handleTabChange('online')}>
                     Online Gallery
+                </button>
+                <button className={`nav-item ${mode === 'saved' ? 'active' : ''}`} onClick={() => handleTabChange('saved')}>
+                    My Templates
                 </button>
                 <button className={`nav-item ${mode === 'custom' ? 'active' : ''}`} onClick={() => handleTabChange('custom')}>
                     Studio Editor
@@ -348,20 +565,33 @@ function App() {
                             ))}
 
                             <div className="image-layer">
-                                <AnimatePresence mode='wait'>
-                                    <motion.img
-                                        key={currentImageSrc}
-                                        src={currentImageSrc}
-                                        alt="Meme"
-                                        className="meme-target"
-                                        initial={{ opacity: 0 }}
-                                        animate={{ opacity: 1 }}
-                                        exit={{ opacity: 0 }}
-                                        transition={{ duration: 0.2 }}
-                                        crossOrigin="anonymous"
-                                        style={getImageStyle()}
+                                {mode === 'custom' && customLayers.map(layer => (
+                                    <ResizableImage
+                                        key={layer.id}
+                                        {...layer}
+                                        initialX={layer.x} initialY={layer.y}
+                                        initialWidth={layer.width} initialHeight={layer.height}
+                                        initialRotate={layer.rotate}
+                                        isSelected={layer.id === selectedLayerId}
+                                        onSelect={setSelectedLayerId}
+                                        onChange={(newAttrs) => updateCustomLayer(layer.id, newAttrs)}
+                                        onRemove={() => removeCustomLayer(layer.id)}
                                     />
-                                </AnimatePresence>
+                                ))}
+
+                                {mode !== 'custom' && singleLayerAttrs && (
+                                    <ResizableImage
+                                        key="single-main"
+                                        id="single-main"
+                                        src={currentImageSrc}
+                                        initialX={singleLayerAttrs.x} initialY={singleLayerAttrs.y}
+                                        initialWidth={singleLayerAttrs.width} initialHeight={singleLayerAttrs.height}
+                                        initialRotate={singleLayerAttrs.rotate}
+                                        isSelected={selectedLayerId === 'single-main'}
+                                        onSelect={setSelectedLayerId}
+                                        onChange={(newAttrs) => setSingleLayerAttrs(prev => ({ ...prev, ...newAttrs }))}
+                                    />
+                                )}
                             </div>
                         </div>
                     </div>
@@ -387,7 +617,7 @@ function App() {
                                 <h3>Select Reaction</h3>
                                 <div className="grid-selector">
                                     {LOCAL_REACTIONS.map(reaction => (
-                                        <button key={reaction.id} onClick={() => setLocalMood(reaction.id)} className={`grid-btn ${localMood === reaction.id ? 'active' : ''}`}>
+                                        <button key={reaction.id} onClick={() => changeContext({ nextLocal: reaction.id })} className={`grid-btn ${localMood === reaction.id ? 'active' : ''}`}>
                                             <img src={reaction.src} alt="" className="grid-thumb" />
                                             <span>{reaction.label}</span>
                                         </button>
@@ -404,17 +634,48 @@ function App() {
                                 </div>
                                 <div className="list-selector" onScroll={handleScroll} ref={scrollRef}>
                                     {visibleMemes.map((meme, index) => (
-                                        <div key={`${meme.id}-${index}`} className={`list-item ${selectedMeme?.id === meme.id ? 'active' : ''}`} onClick={() => setSelectedMeme(meme)}>
+                                        <div key={`${meme.id}-${index}`} className={`list-item ${selectedMeme?.id === meme.id ? 'active' : ''}`} onClick={() => changeContext({ nextMeme: meme })}>
                                             <span className="rank">#{index + 1}</span>
                                             <img src={meme.url} alt={meme.name} />
                                             <div className="item-meta">
                                                 <span className="truncate">{meme.name}</span>
-                                                <button className="link-btn" onClick={(e) => { e.stopPropagation(); handleAddToCustom(meme); }}>Edit in Studio &rarr;</button>
+                                                <div className="flex-row">
+                                                    <button className="link-btn" onClick={(e) => { e.stopPropagation(); handleAddToCustom(meme); }}>Edit in Studio &rarr;</button>
+                                                    <button className="link-btn" style={{ marginLeft: 10, color: '#fafafa' }} onClick={(e) => { e.stopPropagation(); handleSaveTemplate(meme.url, meme.name); }}>♥ Save</button>
+                                                </div>
                                             </div>
                                         </div>
                                     ))}
                                 </div>
                                 <button className="full-width-btn primary" onClick={handleRandomize}>🎲 Randomize</button>
+                            </div>
+                        )}
+
+                        {mode === 'saved' && (
+                            <div className="panel-section">
+                                <h3>My Saved Templates</h3>
+                                {savedTemplates.length === 0 ? (
+                                    <div style={{ padding: 20, textAlign: 'center', color: '#64748b' }}>
+                                        No saved templates yet. <br />
+                                        <small>Save from Online Gallery or Studio.</small>
+                                    </div>
+                                ) : (
+                                    <div className="grid-selector">
+                                        {savedTemplates.map(tpl => (
+                                            <div key={tpl.id} className={`grid-btn ${savedId === tpl.id ? 'active' : ''}`} onClick={() => changeContext({ nextSavedId: tpl.id })}>
+                                                <img src={tpl.src} alt="" className="grid-thumb" />
+                                                <span className="truncate" style={{ maxWidth: '100%' }}>{tpl.label}</span>
+                                                <button
+                                                    className="link-btn"
+                                                    style={{ fontSize: '0.6rem', marginTop: 5, color: '#38bdf8' }}
+                                                    onClick={(e) => { e.stopPropagation(); handleAddToCustom(tpl); }}
+                                                >
+                                                    Edit in Studio
+                                                </button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                         )}
 
@@ -429,6 +690,47 @@ function App() {
                                 <div className="studio-body">
                                     {activeTool === 'adjust' && (
                                         <>
+                                            <div className="control-group-box" style={{ background: 'linear-gradient(45deg, #2b1055, #7597de)', border: '1px solid #7928CA' }}>
+                                                <label style={{ color: 'white', fontWeight: 'bold' }}>✨ AI Magic</label>
+                                                <div className="flex-row">
+                                                    <input
+                                                        type="text"
+                                                        placeholder="Describe a meme image..."
+                                                        value={aiPrompt}
+                                                        onChange={(e) => setAiPrompt(e.target.value)}
+                                                        disabled={isGenerating}
+                                                        style={{ background: 'rgba(255,255,255,0.2)', color: 'white', border: 'none' }}
+                                                    />
+                                                    <button onClick={handleAIGenerate} disabled={isGenerating} style={{ background: 'white', color: '#2b1055' }}>
+                                                        {isGenerating ? '...' : 'Gen'}
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            <div className="control-group-box">
+                                                <label>Insert Assets</label>
+                                                <div className="assets-scroller" style={{ display: 'flex', gap: 5, overflowX: 'auto', paddingBottom: 5, marginBottom: 10 }}>
+                                                    {LOCAL_REACTIONS.map(r => (
+                                                        <img
+                                                            key={r.id}
+                                                            src={r.src}
+                                                            title={r.label}
+                                                            className="asset-thumb"
+                                                            style={{ width: 40, height: 40, borderRadius: 4, cursor: 'pointer', border: '1px solid #475569' }}
+                                                            onClick={() => addCustomLayer(r.src)}
+                                                        />
+                                                    ))}
+                                                </div>
+                                                <div className="flex-row">
+                                                    <select className="pill-select" style={{ width: '100%', background: '#1e293b', border: '1px solid #475569' }} onChange={(e) => { if (e.target.value) addCustomLayer(e.target.value); e.target.value = ""; }}>
+                                                        <option value="">+ Insert Saved Template...</option>
+                                                        {savedTemplates.map(t => (
+                                                            <option key={t.id} value={t.src}>{t.label}</option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            </div>
+
                                             <div className="control-group-box">
                                                 <label>Upload Image</label>
                                                 <input type="file" className="file-input" accept="image/*" onChange={handleFileUpload} />
@@ -437,6 +739,10 @@ function App() {
                                                     <input type="text" placeholder="Image URL..." value={manualUrl} onChange={(e) => setManualUrl(e.target.value)} />
                                                     <button onClick={handleUrlSubmit}>Go</button>
                                                 </div>
+                                                <div className="or-divider" style={{ marginTop: 10 }}>ACTIONS</div>
+                                                <button className="full-width-btn" style={{ background: '#3b82f6', color: 'white', marginTop: 5 }} onClick={handleSaveCanvasAsTemplate}>
+                                                    Save Workspace as Template
+                                                </button>
                                             </div>
                                             <div className="control-group-box">
                                                 <label>Canvas Size</label>
